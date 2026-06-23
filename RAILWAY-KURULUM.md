@@ -42,7 +42,12 @@ PostgreSQL servisini aynı projeye ekleyin: **+ New → Database → PostgreSQL*
 
 ## Sorun giderme
 
-Deploy logunda `HATA:` satırlarına bakın. En sık nedenler:
+Deploy logunda `HATA:` veya `UYARI:` satırlarına bakın. En sık nedenler:
 - `APP_KEY` eksik
 - PostgreSQL servisi yok veya `DATABASE_URL` referansı yanlış
 - Domain oluşturulmamış (`Unexposed service`)
+
+Healthcheck `/health` (statik dosya, Laravel yuklenmeden yanit verir). Deploy Logs:
+- `Sunucu baslatiliyor` görünmeli (migrate öncesi)
+- `Migrate tamamlanamadi` → `DATABASE_URL` referansını ve Postgres servisinin çalıştığını kontrol edin
+- Gerekirse `DB_SSLMODE=prefer` ekleyin (varsayılan artık `prefer`)
