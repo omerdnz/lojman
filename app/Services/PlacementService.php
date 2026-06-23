@@ -26,21 +26,13 @@ class PlacementService
     public function assign(Employee $employee, Room $room, ?User $actor = null, ?string $notes = null): Placement
     {
         return DB::transaction(function () use ($employee, $room, $actor, $notes) {
+            [$employee, $room] = $this->lockEmployeeAndRoom($employee->id, $room->id);
+
             $this->validateEmployee($employee);
             $this->validateRoom($room);
+            $this->assertEmployeeAvailableForAssign($employee, $room);
             PlacementRules::assert($employee, $room);
-
-            $existing = $employee->activePlacement;
-
-            if ($existing) {
-                return $this->transfer($employee, $room, $actor, $notes);
-            }
-
-            if (! $this->capacityService->hasCapacity($room)) {
-                throw ValidationException::withMessages([
-                    'room_id' => 'Oda kapasitesi dolu.',
-                ]);
-            }
+            $this->assertRoomHasCapacity($room);
 
             $placement = Placement::query()->create([
                 'employee_id' => $employee->id,
@@ -70,29 +62,30 @@ class PlacementService
     public function transfer(Employee $employee, Room $room, ?User $actor = null, ?string $notes = null): Placement
     {
         return DB::transaction(function () use ($employee, $room, $actor, $notes) {
+            [$employee, $room] = $this->lockEmployeeAndRoom($employee->id, $room->id);
+
             $this->validateEmployee($employee);
             $this->validateRoom($room);
             PlacementRules::assert($employee, $room);
 
-            $existing = $employee->activePlacement;
+            $existing = $this->resolveActivePlacement($employee);
 
-            if ($existing && (int) $existing->room_id === (int) $room->id) {
+            if (! $existing) {
+                throw ValidationException::withMessages([
+                    'employee_id' => 'Personelin aktif yerleşimi bulunmuyor.',
+                ]);
+            }
+
+            if ((int) $existing->room_id === (int) $room->id) {
                 throw ValidationException::withMessages([
                     'room_id' => 'Personel zaten bu odada.',
                 ]);
             }
 
-            if (! $this->capacityService->hasCapacity($room)) {
-                throw ValidationException::withMessages([
-                    'room_id' => 'Oda kapasitesi dolu.',
-                ]);
-            }
+            $this->assertRoomHasCapacity($room);
 
-            $fromRoomId = $existing?->room_id;
-
-            if ($existing) {
-                $existing->update(['is_active' => false]);
-            }
+            $fromRoomId = $existing->room_id;
+            $existing->update(['is_active' => false]);
 
             $placement = Placement::query()->create([
                 'employee_id' => $employee->id,
@@ -107,7 +100,7 @@ class PlacementService
                 'employee_id' => $employee->id,
                 'from_room_id' => $fromRoomId,
                 'to_room_id' => $room->id,
-                'action' => $fromRoomId ? TransferAction::Transfer : TransferAction::Assign,
+                'action' => TransferAction::Transfer,
                 'performed_by' => $actor?->id,
                 'created_at' => now(),
             ]);
@@ -126,7 +119,8 @@ class PlacementService
     public function remove(Employee $employee, ?User $actor = null, ?string $reason = null): void
     {
         DB::transaction(function () use ($employee, $actor, $reason) {
-            $existing = $employee->activePlacement;
+            $employee = Employee::query()->whereKey($employee->id)->lockForUpdate()->firstOrFail();
+            $existing = $this->resolveActivePlacement($employee);
 
             if (! $existing) {
                 throw ValidationException::withMessages([
@@ -134,7 +128,7 @@ class PlacementService
                 ]);
             }
 
-            $room = $existing->room;
+            $room = Room::query()->whereKey($existing->room_id)->lockForUpdate()->first();
             $fromRoomId = $existing->room_id;
 
             $existing->update(['is_active' => false]);
@@ -156,8 +150,6 @@ class PlacementService
     }
 
     /**
-     * Seçilen personelleri cinsiyetlerine uygun odalara otomatik yerleştirir.
-     *
      * @param  list<int>  $employeeIds
      * @return array{success: int, failed: list<array{employee_id: int, message: string}>}
      */
@@ -169,17 +161,44 @@ class PlacementService
 
         foreach ($employeeIds as $employeeId) {
             try {
-                $employee = Employee::query()->findOrFail($employeeId);
-                $room = $this->findAvailableRoomForEmployee($employee);
+                DB::transaction(function () use ($employeeId, $actor, &$success) {
+                    $employee = Employee::query()->whereKey($employeeId)->lockForUpdate()->firstOrFail();
+                    $room = $this->findAvailableRoomForEmployee($employee);
 
-                if (! $room) {
-                    throw ValidationException::withMessages([
-                        'room_id' => "{$employee->full_name} için uygun boş yer bulunamadı ({$employee->gender?->label()}).",
+                    if (! $room) {
+                        throw ValidationException::withMessages([
+                            'room_id' => "{$employee->full_name} için uygun boş yer bulunamadı ({$employee->gender?->label()}).",
+                        ]);
+                    }
+
+                    $room = Room::query()->whereKey($room->id)->lockForUpdate()->firstOrFail();
+
+                    $this->validateEmployee($employee);
+                    $this->validateRoom($room);
+                    $this->assertEmployeeAvailableForAssign($employee, $room);
+                    PlacementRules::assert($employee, $room);
+                    $this->assertRoomHasCapacity($room);
+
+                    $placement = Placement::query()->create([
+                        'employee_id' => $employee->id,
+                        'room_id' => $room->id,
+                        'assigned_at' => now(),
+                        'assigned_by' => $actor?->id,
+                        'is_active' => true,
                     ]);
-                }
 
-                $this->assignForBulk($employee, $room, $actor);
-                $success++;
+                    TransferHistory::query()->create([
+                        'employee_id' => $employee->id,
+                        'from_room_id' => null,
+                        'to_room_id' => $room->id,
+                        'action' => TransferAction::BulkAssign,
+                        'performed_by' => $actor?->id,
+                        'created_at' => now(),
+                    ]);
+
+                    $this->capacityService->refreshRoomStatus($room);
+                    $success++;
+                });
             } catch (ValidationException $e) {
                 $failed[] = [
                     'employee_id' => $employeeId,
@@ -201,8 +220,8 @@ class PlacementService
         $failed = [];
         $success = 0;
 
-        $room = $room->fresh(['activePlacements']);
-        $freeSlots = max(0, $room->capacity - $room->activePlacements->count());
+        $room = $room->fresh();
+        $freeSlots = $this->capacityService->freeBeds($room);
 
         if (count($employeeIds) > $freeSlots) {
             throw ValidationException::withMessages([
@@ -212,8 +231,7 @@ class PlacementService
 
         foreach ($employeeIds as $employeeId) {
             try {
-                $employee = Employee::query()->findOrFail($employeeId);
-                $this->assignForBulk($employee, $room, $actor);
+                $this->assign($employee = Employee::query()->findOrFail($employeeId), $room->fresh(), $actor);
                 $success++;
             } catch (ValidationException $e) {
                 $failed[] = [
@@ -239,7 +257,7 @@ class PlacementService
         foreach ($employeeIds as $employeeId) {
             try {
                 $employee = Employee::query()->findOrFail($employeeId);
-                $this->removeForBulk($employee, $actor);
+                $this->remove($employee, $actor);
                 $success++;
             } catch (ValidationException $e) {
                 $failed[] = [
@@ -252,82 +270,6 @@ class PlacementService
         return compact('success', 'failed');
     }
 
-    private function assignForBulk(Employee $employee, Room $room, ?User $actor = null): Placement
-    {
-        return DB::transaction(function () use ($employee, $room, $actor) {
-            $this->validateEmployee($employee);
-            $this->validateRoom($room);
-            PlacementRules::assert($employee, $room);
-
-            $existing = $employee->activePlacement;
-
-            if ($existing) {
-                throw ValidationException::withMessages([
-                    'employee_id' => "{$employee->full_name} zaten bir odaya yerleşmiş.",
-                ]);
-            }
-
-            if (! $this->capacityService->hasCapacity($room)) {
-                throw ValidationException::withMessages([
-                    'room_id' => 'Oda kapasitesi dolu.',
-                ]);
-            }
-
-            $placement = Placement::query()->create([
-                'employee_id' => $employee->id,
-                'room_id' => $room->id,
-                'assigned_at' => now(),
-                'assigned_by' => $actor?->id,
-                'is_active' => true,
-            ]);
-
-            TransferHistory::query()->create([
-                'employee_id' => $employee->id,
-                'from_room_id' => null,
-                'to_room_id' => $room->id,
-                'action' => TransferAction::BulkAssign,
-                'performed_by' => $actor?->id,
-                'created_at' => now(),
-            ]);
-
-            $this->capacityService->refreshRoomStatus($room);
-            $room->unsetRelation('activePlacements');
-
-            return $placement;
-        });
-    }
-
-    private function removeForBulk(Employee $employee, ?User $actor = null): void
-    {
-        DB::transaction(function () use ($employee, $actor) {
-            $existing = $employee->activePlacement;
-
-            if (! $existing) {
-                throw ValidationException::withMessages([
-                    'employee_id' => 'Personelin aktif yerleşimi bulunmuyor.',
-                ]);
-            }
-
-            $room = $existing->room;
-            $fromRoomId = $existing->room_id;
-
-            $existing->update(['is_active' => false]);
-
-            TransferHistory::query()->create([
-                'employee_id' => $employee->id,
-                'from_room_id' => $fromRoomId,
-                'to_room_id' => null,
-                'action' => TransferAction::BulkRemove,
-                'performed_by' => $actor?->id,
-                'created_at' => now(),
-            ]);
-
-            if ($room) {
-                $this->capacityService->refreshRoomStatus($room);
-            }
-        });
-    }
-
     private function findAvailableRoomForEmployee(Employee $employee): ?Room
     {
         if (! $employee->gender) {
@@ -338,7 +280,7 @@ class PlacementService
 
         return PlacementRules::availableRoomsQuery($employee)
             ->with(['floor.block'])
-            ->withCount('activePlacements as occupancy')
+            ->orderBy('id')
             ->get()
             ->filter(fn (Room $room) => $this->capacityService->hasCapacity($room))
             ->sort(fn (Room $a, Room $b) => $this->roomPreferenceScore($b, $employee) <=> $this->roomPreferenceScore($a, $employee))
@@ -348,7 +290,7 @@ class PlacementService
     private function roomPreferenceScore(Room $room, Employee $employee): int
     {
         $room->loadMissing('floor.block');
-        $score = (int) ($room->occupancy ?? 0);
+        $score = $this->capacityService->currentOccupancy($room);
 
         if ($employee->gender === Gender::Female) {
             if ($room->floor?->block?->gender_policy === GenderPolicy::Female) {
@@ -364,11 +306,73 @@ class PlacementService
         return $score;
     }
 
+    /**
+     * @return array{0: Employee, 1: Room}
+     */
+    private function lockEmployeeAndRoom(int $employeeId, int $roomId): array
+    {
+        $employee = Employee::query()->whereKey($employeeId)->lockForUpdate()->firstOrFail();
+        $room = Room::query()->whereKey($roomId)->lockForUpdate()->firstOrFail();
+
+        return [$employee, $room];
+    }
+
+    private function resolveActivePlacement(Employee $employee): ?Placement
+    {
+        return Placement::query()
+            ->where('employee_id', $employee->id)
+            ->where('is_active', true)
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    private function assertEmployeeAvailableForAssign(Employee $employee, Room $room): void
+    {
+        $existing = $this->resolveActivePlacement($employee);
+
+        if ($existing) {
+            if ((int) $existing->room_id === (int) $room->id) {
+                throw ValidationException::withMessages([
+                    'employee_id' => "{$employee->full_name} zaten bu odada kayıtlı.",
+                ]);
+            }
+
+            throw ValidationException::withMessages([
+                'employee_id' => "{$employee->full_name} zaten bir odaya yerleşmiş. Önce çıkarın veya transfer kullanın.",
+            ]);
+        }
+
+        if (Placement::query()
+            ->where('room_id', $room->id)
+            ->where('employee_id', $employee->id)
+            ->where('is_active', true)
+            ->exists()) {
+            throw ValidationException::withMessages([
+                'employee_id' => "{$employee->full_name} zaten bu odada kayıtlı.",
+            ]);
+        }
+    }
+
+    private function assertRoomHasCapacity(Room $room): void
+    {
+        if (! $this->capacityService->hasCapacity($room)) {
+            throw ValidationException::withMessages([
+                'room_id' => 'Oda kapasitesi dolu.',
+            ]);
+        }
+    }
+
     private function validateEmployee(Employee $employee): void
     {
         if ($employee->status !== EmployeeStatus::Active) {
             throw ValidationException::withMessages([
                 'employee_id' => 'Yalnızca aktif personel yerleştirilebilir.',
+            ]);
+        }
+
+        if (! $employee->gender) {
+            throw ValidationException::withMessages([
+                'employee_id' => "{$employee->full_name} için cinsiyet bilgisi tanımlı değil.",
             ]);
         }
     }
@@ -381,5 +385,4 @@ class PlacementService
             ]);
         }
     }
-
 }

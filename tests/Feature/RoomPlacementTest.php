@@ -312,6 +312,104 @@ class RoomPlacementTest extends TestCase
         $response->assertStatus(422);
     }
 
+    public function test_cannot_assign_same_employee_twice(): void
+    {
+        $this->actingAs($this->admin)->postJson(route('assignments.store'), [
+            'employee_id' => $this->maleEmployee->id,
+            'room_id' => $this->maleRoom->id,
+        ])->assertOk();
+
+        $response = $this->actingAs($this->admin)->postJson(route('assignments.store'), [
+            'employee_id' => $this->maleEmployee->id,
+            'room_id' => $this->maleRoom->id,
+        ]);
+
+        $response->assertStatus(422);
+        $this->assertSame(1, Placement::query()
+            ->where('employee_id', $this->maleEmployee->id)
+            ->where('is_active', true)
+            ->count());
+    }
+
+    public function test_cannot_exceed_room_capacity(): void
+    {
+        $this->maleRoom->update(['capacity' => 1]);
+
+        $secondEmployee = Employee::query()->create([
+            'personnel_number' => 'TEST003',
+            'full_name' => 'Test Personel 3',
+            'gender' => Gender::Male,
+            'department_id' => $this->maleEmployee->department_id,
+            'status' => EmployeeStatus::Active,
+        ]);
+
+        $this->actingAs($this->admin)->postJson(route('assignments.store'), [
+            'employee_id' => $this->maleEmployee->id,
+            'room_id' => $this->maleRoom->id,
+        ])->assertOk();
+
+        $response = $this->actingAs($this->admin)->postJson(route('assignments.store'), [
+            'employee_id' => $secondEmployee->id,
+            'room_id' => $this->maleRoom->id,
+        ]);
+
+        $response->assertStatus(422);
+        $this->assertSame(1, Placement::query()
+            ->where('room_id', $this->maleRoom->id)
+            ->where('is_active', true)
+            ->count());
+    }
+
+    public function test_cannot_assign_already_placed_employee_to_another_room_without_transfer(): void
+    {
+        $otherRoom = Room::query()->create([
+            'floor_id' => $this->maleRoom->floor_id,
+            'room_number' => 'TEST-98',
+            'capacity' => 4,
+            'gender' => Gender::Male,
+            'status' => RoomStatus::Available,
+        ]);
+
+        $this->actingAs($this->admin)->postJson(route('assignments.store'), [
+            'employee_id' => $this->maleEmployee->id,
+            'room_id' => $this->maleRoom->id,
+        ])->assertOk();
+
+        $response = $this->actingAs($this->admin)->postJson(route('assignments.store'), [
+            'employee_id' => $this->maleEmployee->id,
+            'room_id' => $otherRoom->id,
+        ]);
+
+        $response->assertStatus(422);
+        $this->assertDatabaseHas('placements', [
+            'employee_id' => $this->maleEmployee->id,
+            'room_id' => $this->maleRoom->id,
+            'is_active' => true,
+        ]);
+    }
+
+    public function test_bulk_assign_stops_when_no_room_available(): void
+    {
+        Room::query()->where('id', '!=', $this->maleRoom->id)->update(['status' => RoomStatus::Inactive]);
+        $this->maleRoom->update(['capacity' => 1]);
+
+        $employee2 = Employee::query()->create([
+            'personnel_number' => 'TEST004',
+            'full_name' => 'Test Personel 4',
+            'gender' => Gender::Male,
+            'department_id' => $this->maleEmployee->department_id,
+            'status' => EmployeeStatus::Active,
+        ]);
+
+        $response = $this->actingAs($this->admin)->postJson(route('assignments.bulk-assign'), [
+            'employee_ids' => [$this->maleEmployee->id, $employee2->id],
+        ]);
+
+        $response->assertOk();
+        $response->assertJsonPath('success', 1);
+        $this->assertCount(1, $response->json('failed'));
+    }
+
     public function test_can_bulk_remove_employees_from_room(): void
     {
         $this->actingAs($this->admin)->postJson(route('assignments.store'), [

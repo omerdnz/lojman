@@ -251,8 +251,10 @@ document.getElementById('roomModal')?.addEventListener('click', e => {
 
 document.getElementById('modalRoomSearch')?.addEventListener('input', filterModalRooms);
 
-document.querySelectorAll('.assign-room-btn').forEach(btn => {
-    btn.addEventListener('click', () => assignRoom(parseInt(btn.dataset.roomId)));
+document.getElementById('modalRoomList')?.addEventListener('click', e => {
+    const btn = e.target.closest('.assign-room-btn');
+    if (!btn || btn.disabled) return;
+    assignRoom(parseInt(btn.dataset.roomId));
 });
 
 function filterModalRooms() {

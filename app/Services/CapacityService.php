@@ -13,7 +13,11 @@ class CapacityService
 
     public function currentOccupancy(Room $room): int
     {
-        return $room->activePlacements()->count();
+        if ($room->exists) {
+            return (int) $room->activePlacements()->count();
+        }
+
+        return 0;
     }
 
     public function effectiveCapacity(Room $room): int
