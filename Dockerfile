@@ -18,7 +18,11 @@ RUN composer install --no-dev --optimize-autoloader --no-interaction --no-script
 
 COPY . .
 
-RUN composer dump-autoload --optimize \
+RUN mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache \
+    && chmod -R 775 storage bootstrap/cache \
+    && composer dump-autoload --optimize \
     && chmod +x scripts/railway-start.sh
+
+EXPOSE 8080
 
 CMD ["sh", "scripts/railway-start.sh"]
