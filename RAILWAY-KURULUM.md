@@ -16,11 +16,13 @@ PostgreSQL servisini aynı projeye ekleyin: **+ New → Database → PostgreSQL*
 | `APP_LOCALE` | `tr` |
 | `DB_CONNECTION` | `pgsql` |
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` *(PostgreSQL servis adınıza göre)* |
-| `SESSION_DRIVER` | `database` |
-| `CACHE_STORE` | `database` |
-| `QUEUE_CONNECTION` | `database` |
+| `SESSION_DRIVER` | `file` |
+| `CACHE_STORE` | `file` |
+| `QUEUE_CONNECTION` | `sync` |
 | `LOG_CHANNEL` | `stderr` |
 | `RUN_SEED` | `true` *(yalnızca ilk deploy)* |
+
+> **Önemli:** `DATABASE_URL` kullanıyorsanız `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` **tanımlamayın** — bağlantıyı bozar.
 
 > `DATABASE_URL` Railway PostgreSQL eklentisinden otomatik gelir. Referans: Variables → **Add Reference** → Postgres → `DATABASE_URL`
 
@@ -51,3 +53,19 @@ Healthcheck `/health` (statik dosya, Laravel yuklenmeden yanit verir). Deploy Lo
 - `Sunucu baslatiliyor` görünmeli (migrate öncesi)
 - `Migrate tamamlanamadi` → `DATABASE_URL` referansını ve Postgres servisinin çalıştığını kontrol edin
 - Gerekirse `DB_SSLMODE=prefer` ekleyin (varsayılan artık `prefer`)
+
+## 500 Server Error
+
+1. **Variables** → şunları düzeltin:
+   - `SESSION_DRIVER` = `file`
+   - `CACHE_STORE` = `file`
+   - `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` varsa **silin**
+   - `DATABASE_URL` = Postgres referansı olmalı
+   - `APP_URL` = `https://lojman-production.up.railway.app` (kendi domain'iniz)
+2. Geçici olarak `APP_DEBUG` = `true` yapın → sayfayı yenileyin → hatayı okuyun → tekrar `false` yapın
+3. **Console** sekmesinde:
+   ```bash
+   php artisan migrate --force
+   php artisan db:seed --force
+   ```
+4. **Redeploy** yapın
